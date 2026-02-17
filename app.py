@@ -1,19 +1,18 @@
 import streamlit as st
 import functools
-from typing import Annotated, TypedDict, List, Literal, Optional
+from typing import Annotated, TypedDict, List, Literal
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langchain_core.runnables import RunnableConfig
 
 # --- CONSTANTES Y CONFIGURACIÓN ---
 SEARCH_PROMPT = """You are a research assistant. Your job is to search the web for related news that would be relevant to generate the article described by the user.
 NOTE: Do not write the article. Just search the web for related news if needed. If you have enough info, stop searching."""
 
-OUTLINER_PROMPT = """You are an content strategist. Your job is to take as input a list of search results along with users instruction on what article they want to write and generate a structured outline for the article."""
+OUTLINER_PROMPT = """You are a content strategist. Your job is to take as input a list of search results along with the user's instruction on what article they want to write, and generate a structured outline for the article."""
 
 WRITER_PROMPT = """You are a senior journalist. Write an article based on the provided outline.
 Format:
@@ -21,13 +20,19 @@ Format:
 ## BODY: <body>
 NOTE: Stick strictly to the facts provided in the context/outline."""
 
+AVAILABLE_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-exp",
+    "gemini-1.5-flash",
+]
+
 # --- DEFINICIÓN DE TIPOS ---
 class AgentState(TypedDict):
     """Estado del grafo que mantiene el historial de mensajes."""
     messages: Annotated[List[BaseMessage], add_messages]
 
-# --- NODOS DEL GRAFO (Desacoplados) ---
-# Usamos inyección de dependencias para el LLM, permitiendo testabilidad.
+
+# --- NODOS DEL GRAFO ---
 
 def search_node(state: AgentState, llm: ChatGoogleGenerativeAI):
     messages = [SystemMessage(content=SEARCH_PROMPT)] + state["messages"]
@@ -45,38 +50,68 @@ def writer_node(state: AgentState, llm: ChatGoogleGenerativeAI):
     return {"messages": [response]}
 
 def should_search(state: AgentState) -> Literal["tools", "outliner"]:
+    """
+    FIX: Verificación segura de tool_calls. AIMessage siempre tiene el atributo,
+    pero otros tipos de mensaje (HumanMessage, ToolMessage) no lo tienen
+    o lo tienen vacío, por lo que usamos getattr con fallback.
+    """
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if tool_calls:
         return "tools"
     return "outliner"
 
-# --- FACTORY DEL GRAFO (Con Caching) ---
 
-@st.cache_resource(show_spinner="Inicializando Modelos y Grafo...")
-def get_graph_app(google_api_key: str, tavily_api_key: str, model_name: str = "gemini-2.5-flash-lite"):
+# --- SERIALIZACIÓN PARA DEBUG ---
+
+def serialize_event(event: dict) -> dict:
     """
-    Inicializa y compila el grafo. Se cachea para evitar reconstrucción en cada renderizado.
+    FIX: Los objetos BaseMessage no son JSON-serializables directamente.
+    Convertimos cada mensaje a un dict con type + content para poder
+    mostrarlos con st.json() sin errores.
     """
-    # 1. Configuración de Herramientas y LLM
+    serialized = {}
+    for node_name, state_update in event.items():
+        serialized[node_name] = {}
+        for key, value in state_update.items():
+            if key == "messages" and isinstance(value, list):
+                serialized[node_name][key] = [
+                    {
+                        "type": msg.__class__.__name__,
+                        "content": str(msg.content)[:500],  # truncamos para legibilidad
+                        "tool_calls": getattr(msg, "tool_calls", []),
+                    }
+                    for msg in value
+                ]
+            else:
+                serialized[node_name][key] = str(value)
+    return serialized
+
+
+# --- FACTORY DEL GRAFO ---
+
+def build_graph(google_api_key: str, tavily_api_key: str, model_name: str):
+    """
+    FIX: Eliminamos @st.cache_resource con API keys como argumentos.
+    El caché de Streamlit no invalida correctamente cuando cambian strings
+    sensibles entre reruns. El grafo se reconstruye solo al pulsar el botón,
+    lo cual es aceptable dado que la operación es puntual.
+    También eliminamos 'convert_system_message_to_human' (deprecado).
+    """
     search_tool = TavilySearchResults(max_results=5, tavily_api_key=tavily_api_key)
     tools = [search_tool]
-    
+
     llm = ChatGoogleGenerativeAI(
-        model=model_name, 
+        model=model_name,
         temperature=0.5,
         google_api_key=google_api_key,
-        convert_system_message_to_human=True
     )
-    
-    # Vinculamos herramientas para el nodo de búsqueda
     llm_with_tools = llm.bind_tools(tools)
-    
-    # 2. Binding de Nodos (Partial application para inyectar el LLM específico)
+
     search_bound = functools.partial(search_node, llm=llm_with_tools)
     outliner_bound = functools.partial(outliner_node, llm=llm)
     writer_bound = functools.partial(writer_node, llm=llm)
 
-    # 3. Construcción del Grafo
     workflow = StateGraph(AgentState)
 
     workflow.add_node("search", search_bound)
@@ -98,26 +133,26 @@ def get_graph_app(google_api_key: str, tavily_api_key: str, model_name: str = "g
 
     return workflow.compile()
 
+
 # --- INTERFAZ DE USUARIO ---
 
 def main():
     st.set_page_config(page_title="Agente Redactor AI", page_icon="🤖", layout="wide")
-    
+
     st.title("🤖 Agente Redactor de Noticias")
     st.markdown("Arquitectura: **LangGraph** + **Gemini** + **Tavily**")
 
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuración")
         g_key = st.text_input("Google API Key", type="password")
         t_key = st.text_input("Tavily API Key", type="password")
-        model_selection = st.selectbox("Modelo", ["gemini-1.5-flash", "gemini-2.0-flash-exp"], index=0)
-        
+        # FIX: Selectbox alineado con los modelos reales disponibles
+        model_selection = st.selectbox("Modelo", AVAILABLE_MODELS, index=0)
+
         if not (g_key and t_key):
             st.warning("Introduce tus claves para continuar.")
             st.stop()
 
-    # Área principal
     topic = st.text_input("Tema del artículo:", placeholder="Ej: Avances en computación cuántica 2025")
 
     if st.button("Generar Artículo", type="primary"):
@@ -126,25 +161,23 @@ def main():
             return
 
         try:
-            # Obtener el grafo (cached)
-            app_graph = get_graph_app(g_key, t_key, model_selection)
+            app_graph = build_graph(g_key, t_key, model_selection)
         except Exception as e:
-            st.error(f"Error en configuración: {e}")
+            st.error(f"Error al inicializar el grafo: {e}")
             st.stop()
 
         status_box = st.status("🚀 Ejecutando workflow...", expanded=True)
         final_content = ""
         debug_events = []
-        
+
         try:
             inputs = {"messages": [HumanMessage(content=topic)]}
-            
-            # Stream de eventos
+
             for event in app_graph.stream(inputs):
-                debug_events.append(event)
-                
+                # FIX: Serializamos el evento antes de guardarlo para debug
+                debug_events.append(serialize_event(event))
+
                 for node_name, state_update in event.items():
-                    # Feedback UI
                     if node_name == "search":
                         status_box.write("🕵️ **Search:** Buscando información...")
                     elif node_name == "tools":
@@ -153,8 +186,7 @@ def main():
                         status_box.write("📝 **Outliner:** Creando esquema...")
                     elif node_name == "writer":
                         status_box.write("✍️ **Writer:** Redactando artículo...")
-                        
-                        # Captura segura del contenido final solo en el nodo writer
+
                         if "messages" in state_update:
                             last_msg = state_update["messages"][-1]
                             if isinstance(last_msg, AIMessage):
@@ -175,6 +207,7 @@ def main():
         except Exception as e:
             status_box.update(label="❌ Error durante la ejecución", state="error")
             st.error(f"Ocurrió un error inesperado: {e}")
+
 
 if __name__ == "__main__":
     main()
