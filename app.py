@@ -34,7 +34,7 @@ def create_graph(google_api_key: str, tavily_api_key: str):
     
     # 1. Inicialización de herramientas y modelo
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", # Usamos 1.5 Flash que es muy estable y rápido
+        model="gemini-2.5-flash-lite", # Usamos 1.5 Flash que es muy estable y rápido
         temperature=0.5,
         google_api_key=google_api_key,
         convert_system_message_to_human=True
