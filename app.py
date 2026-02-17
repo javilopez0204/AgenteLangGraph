@@ -114,7 +114,7 @@ def main():
     st.set_page_config(page_title="Agente Redactor AI", page_icon="🤖", layout="wide")
     
     st.title("🤖 Agente Redactor de Noticias")
-    st.markdown("Arquitectura: **LangGraph** + **Gemini 1.5** + **Tavily**")
+    st.markdown("Arquitectura: **LangGraph** + **Gemini 2.5** + **Tavily**")
 
     # Sidebar
     with st.sidebar:
