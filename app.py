@@ -53,7 +53,7 @@ def should_search(state: AgentState) -> Literal["tools", "outliner"]:
 # --- FACTORY DEL GRAFO (Con Caching) ---
 
 @st.cache_resource(show_spinner="Inicializando Modelos y Grafo...")
-def get_graph_app(google_api_key: str, tavily_api_key: str, model_name: str = "gemini-1.5-flash"):
+def get_graph_app(google_api_key: str, tavily_api_key: str, model_name: str = "gemini-2.5-flash-lite"):
     """
     Inicializa y compila el grafo. Se cachea para evitar reconstrucción en cada renderizado.
     """
