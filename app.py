@@ -41,7 +41,7 @@ def create_graph(google_api_key: str, tavily_api_key: str):
     
     # Configuración segura del LLM
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash", 
+        model="gemini-2.5-flash-lite", 
         temperature=0.5,
         google_api_key=google_api_key,
         convert_system_message_to_human=True # A veces necesario para Gemini
