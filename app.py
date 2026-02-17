@@ -1,13 +1,15 @@
 import streamlit as st
-from typing import Annotated, TypedDict, List, Literal
+import functools
+from typing import Annotated, TypedDict, List, Literal, Optional
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langchain_core.runnables import RunnableConfig
 
-# --- CONSTANTES Y PROMPTS ---
+# --- CONSTANTES Y CONFIGURACIÓN ---
 SEARCH_PROMPT = """You are a research assistant. Your job is to search the web for related news that would be relevant to generate the article described by the user.
 NOTE: Do not write the article. Just search the web for related news if needed. If you have enough info, stop searching."""
 
@@ -17,65 +19,69 @@ WRITER_PROMPT = """You are a senior journalist. Write an article based on the pr
 Format:
 # TITLE: <title>
 ## BODY: <body>
-
 NOTE: Stick strictly to the facts provided in the context/outline."""
 
 # --- DEFINICIÓN DE TIPOS ---
 class AgentState(TypedDict):
+    """Estado del grafo que mantiene el historial de mensajes."""
     messages: Annotated[List[BaseMessage], add_messages]
 
-# --- FUNCIONES DE LÓGICA ---
+# --- NODOS DEL GRAFO (Desacoplados) ---
+# Usamos inyección de dependencias para el LLM, permitiendo testabilidad.
 
-# ⚠️ CORRECCIÓN: Eliminamos @st.cache_resource para evitar errores de conexión/sesión cerrada en segundas ejecuciones.
-def create_graph(google_api_key: str, tavily_api_key: str):
+def search_node(state: AgentState, llm: ChatGoogleGenerativeAI):
+    messages = [SystemMessage(content=SEARCH_PROMPT)] + state["messages"]
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+def outliner_node(state: AgentState, llm: ChatGoogleGenerativeAI):
+    messages = [SystemMessage(content=OUTLINER_PROMPT)] + state["messages"]
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+def writer_node(state: AgentState, llm: ChatGoogleGenerativeAI):
+    messages = [SystemMessage(content=WRITER_PROMPT)] + state["messages"]
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+def should_search(state: AgentState) -> Literal["tools", "outliner"]:
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return "outliner"
+
+# --- FACTORY DEL GRAFO (Con Caching) ---
+
+@st.cache_resource(show_spinner="Inicializando Modelos y Grafo...")
+def get_graph_app(google_api_key: str, tavily_api_key: str, model_name: str = "gemini-1.5-flash"):
     """
-    Crea y compila el grafo. Se genera fresco en cada ejecución para garantizar conexiones activas.
+    Inicializa y compila el grafo. Se cachea para evitar reconstrucción en cada renderizado.
     """
+    # 1. Configuración de Herramientas y LLM
+    search_tool = TavilySearchResults(max_results=5, tavily_api_key=tavily_api_key)
+    tools = [search_tool]
     
-    # 1. Inicialización de herramientas y modelo
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite", # Usamos 1.5 Flash que es muy estable y rápido
+        model=model_name, 
         temperature=0.5,
         google_api_key=google_api_key,
         convert_system_message_to_human=True
     )
     
-    search_tool = TavilySearchResults(
-        max_results=5, 
-        tavily_api_key=tavily_api_key
-    )
-    tools = [search_tool]
-    
+    # Vinculamos herramientas para el nodo de búsqueda
     llm_with_tools = llm.bind_tools(tools)
-
-    # 2. Definición de Nodos
-    def search_node(state: AgentState):
-        messages = [SystemMessage(content=SEARCH_PROMPT)] + state["messages"]
-        response = llm_with_tools.invoke(messages)
-        return {"messages": [response]}
-
-    def outliner_node(state: AgentState):
-        messages = [SystemMessage(content=OUTLINER_PROMPT)] + state["messages"]
-        response = llm.invoke(messages)
-        return {"messages": [response]}
-
-    def writer_node(state: AgentState):
-        messages = [SystemMessage(content=WRITER_PROMPT)] + state["messages"]
-        response = llm.invoke(messages)
-        return {"messages": [response]}
-
-    def should_search(state: AgentState) -> Literal["tools", "outliner"]:
-        last_message = state["messages"][-1]
-        if last_message.tool_calls:
-            return "tools"
-        return "outliner"
+    
+    # 2. Binding de Nodos (Partial application para inyectar el LLM específico)
+    search_bound = functools.partial(search_node, llm=llm_with_tools)
+    outliner_bound = functools.partial(outliner_node, llm=llm)
+    writer_bound = functools.partial(writer_node, llm=llm)
 
     # 3. Construcción del Grafo
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("search", search_node)
-    workflow.add_node("outliner", outliner_node)
-    workflow.add_node("writer", writer_node)
+    workflow.add_node("search", search_bound)
+    workflow.add_node("outliner", outliner_bound)
+    workflow.add_node("writer", writer_bound)
     workflow.add_node("tools", ToolNode(tools))
 
     workflow.set_entry_point("search")
@@ -83,10 +89,7 @@ def create_graph(google_api_key: str, tavily_api_key: str):
     workflow.add_conditional_edges(
         "search",
         should_search,
-        {
-            "tools": "tools",
-            "outliner": "outliner"
-        }
+        {"tools": "tools", "outliner": "outliner"}
     )
 
     workflow.add_edge("tools", "search")
@@ -105,65 +108,73 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("🔐 Credenciales")
+        st.header("⚙️ Configuración")
         g_key = st.text_input("Google API Key", type="password")
         t_key = st.text_input("Tavily API Key", type="password")
+        model_selection = st.selectbox("Modelo", ["gemini-1.5-flash", "gemini-2.0-flash-exp"], index=0)
         
         if not (g_key and t_key):
             st.warning("Introduce tus claves para continuar.")
-            st.stop() # Detiene la ejecución limpiamente si no hay claves
+            st.stop()
 
     # Área principal
-    topic = st.text_input("Tema del artículo:", placeholder="Ej: Impacto de la IA en la medicina 2025")
+    topic = st.text_input("Tema del artículo:", placeholder="Ej: Avances en computación cuántica 2025")
 
     if st.button("Generar Artículo", type="primary"):
         if not topic:
             st.warning("Por favor escribe un tema.")
-        else:
-            # Inicializamos el grafo fresco aquí
-            try:
-                app_graph = create_graph(g_key, t_key)
-            except Exception as e:
-                st.error(f"Error al inicializar el modelo: {e}")
-                st.stop()
+            return
 
-            status_box = st.status("🚀 Ejecutando workflow...", expanded=True)
+        try:
+            # Obtener el grafo (cached)
+            app_graph = get_graph_app(g_key, t_key, model_selection)
+        except Exception as e:
+            st.error(f"Error en configuración: {e}")
+            st.stop()
+
+        status_box = st.status("🚀 Ejecutando workflow...", expanded=True)
+        final_content = ""
+        debug_events = []
+        
+        try:
+            inputs = {"messages": [HumanMessage(content=topic)]}
             
-            final_article_content = None # Variable para guardar el resultado final
-            
-            try:
-                inputs = {"messages": [HumanMessage(content=topic)]}
+            # Stream de eventos
+            for event in app_graph.stream(inputs):
+                debug_events.append(event)
                 
-                # Iterar sobre los eventos del grafo
-                for event in app_graph.stream(inputs):
-                    for node_name, state_update in event.items():
+                for node_name, state_update in event.items():
+                    # Feedback UI
+                    if node_name == "search":
+                        status_box.write("🕵️ **Search:** Buscando información...")
+                    elif node_name == "tools":
+                        status_box.write("🌐 **Tavily:** Obteniendo datos web...")
+                    elif node_name == "outliner":
+                        status_box.write("📝 **Outliner:** Creando esquema...")
+                    elif node_name == "writer":
+                        status_box.write("✍️ **Writer:** Redactando artículo...")
                         
-                        # Feedback visual
-                        if node_name == "search":
-                            status_box.write("🕵️ **Investigador:** Analizando información...")
-                        elif node_name == "tools":
-                            status_box.write("🌐 **Herramienta:** Buscando en la web...")
-                        elif node_name == "outliner":
-                            status_box.write("📝 **Planificador:** Creando esquema...")
-                        elif node_name == "writer":
-                            status_box.write("✍️ **Redactor:** Escribiendo artículo final...")
-                            # ⚠️ CAPTURA SEGURA: Guardamos explícitamente lo que produce el writer
-                            if "messages" in state_update:
-                                final_article_content = state_update["messages"][-1].content
-                        
-                status_box.update(label="✅ ¡Completado!", state="complete", expanded=False)
+                        # Captura segura del contenido final solo en el nodo writer
+                        if "messages" in state_update:
+                            last_msg = state_update["messages"][-1]
+                            if isinstance(last_msg, AIMessage):
+                                final_content = last_msg.content
 
-                # Mostrar resultado final fuera del bucle
-                if final_article_content:
-                    st.divider()
-                    st.subheader("📰 Resultado Final")
-                    st.markdown(final_article_content)
-                else:
-                    st.error("El flujo terminó pero no se detectó contenido final del redactor.")
+            status_box.update(label="✅ Proceso completado", state="complete", expanded=False)
 
-            except Exception as e:
-                status_box.update(label="❌ Error", state="error")
-                st.error(f"Ocurrió un error en la ejecución: {e}")
+            if final_content:
+                st.divider()
+                st.subheader("📰 Artículo Generado")
+                st.markdown(final_content)
+            else:
+                st.warning("El flujo terminó pero no se detectó contenido final en el nodo Writer.")
+
+            with st.expander("🔍 Ver traza interna (Debug)"):
+                st.json(debug_events)
+
+        except Exception as e:
+            status_box.update(label="❌ Error durante la ejecución", state="error")
+            st.error(f"Ocurrió un error inesperado: {e}")
 
 if __name__ == "__main__":
     main()
