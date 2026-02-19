@@ -20,11 +20,8 @@ Format:
 ## BODY: <body>
 NOTE: Stick strictly to the facts provided in the context/outline."""
 
-AVAILABLE_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-exp",
-    "gemini-1.5-flash",
-]
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
+MAX_RETRIES = 3
 
 # --- DEFINICIÓN DE TIPOS ---
 class AgentState(TypedDict):
@@ -58,7 +55,16 @@ def search_node(state: AgentState, llm: ChatGoogleGenerativeAI):
         return {"error": tool_error, "messages": []}
 
     messages = [SystemMessage(content=SEARCH_PROMPT)] + state["messages"]
-    response = llm.invoke(messages)
+
+    # FIX: reintento si el LLM devuelve respuesta vacía sin tool_calls (cold start de Gemini)
+    response = None
+    for attempt in range(MAX_RETRIES):
+        response = llm.invoke(messages)
+        has_tool_calls = bool(getattr(response, "tool_calls", None))
+        has_content = bool(response.content and response.content.strip())
+        if has_tool_calls or has_content:
+            break
+
     return {"messages": [response], "error": ""}
 
 
@@ -70,7 +76,14 @@ def outliner_node(state: AgentState, llm: ChatGoogleGenerativeAI):
 
 def writer_node(state: AgentState, llm: ChatGoogleGenerativeAI):
     messages = [SystemMessage(content=WRITER_PROMPT)] + state["messages"]
-    response = llm.invoke(messages)
+
+    # FIX: reintento si el LLM devuelve contenido vacio
+    response = None
+    for attempt in range(MAX_RETRIES):
+        response = llm.invoke(messages)
+        if response.content and response.content.strip():
+            break
+
     return {"messages": [response]}
 
 
@@ -171,7 +184,8 @@ def main():
         st.header("⚙️ Configuración")
         g_key = st.text_input("Google API Key", type="password")
         t_key = st.text_input("Tavily API Key", type="password")
-        model_selection = st.selectbox("Modelo", AVAILABLE_MODELS, index=0)
+        st.text_input("Modelo", value=DEFAULT_MODEL, disabled=True)
+        model_selection = DEFAULT_MODEL
 
         if not (g_key and t_key):
             st.warning("Introduce tus claves para continuar.")
