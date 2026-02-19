@@ -3,7 +3,7 @@ import functools
 from typing import Annotated, TypedDict, List, Literal
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, HumanMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -28,33 +28,63 @@ AVAILABLE_MODELS = [
 
 # --- DEFINICIÓN DE TIPOS ---
 class AgentState(TypedDict):
-    """Estado del grafo que mantiene el historial de mensajes."""
     messages: Annotated[List[BaseMessage], add_messages]
+    error: str  # FIX: campo para propagar errores críticos al frontend
+
+
+# --- HELPERS ---
+
+def _has_tool_error(state: AgentState) -> str | None:
+    """
+    FIX: Detecta si el último ToolMessage contiene un error HTTP (ej. 401 Tavily).
+    Devuelve el texto del error o None si todo está bien.
+    """
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, ToolMessage):
+            content = str(msg.content)
+            if "Error" in content or "error" in content or "Unauthorized" in content:
+                return content
+            break
+    return None
 
 
 # --- NODOS DEL GRAFO ---
 
 def search_node(state: AgentState, llm: ChatGoogleGenerativeAI):
+    # FIX: Si ya venimos de un ToolMessage con error, no volvemos a invocar el LLM
+    # en bucle; marcamos el error y dejamos que should_search corte el flujo.
+    tool_error = _has_tool_error(state)
+    if tool_error:
+        return {"error": tool_error, "messages": []}
+
     messages = [SystemMessage(content=SEARCH_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
-    return {"messages": [response]}
+    return {"messages": [response], "error": ""}
+
 
 def outliner_node(state: AgentState, llm: ChatGoogleGenerativeAI):
     messages = [SystemMessage(content=OUTLINER_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
     return {"messages": [response]}
 
+
 def writer_node(state: AgentState, llm: ChatGoogleGenerativeAI):
     messages = [SystemMessage(content=WRITER_PROMPT)] + state["messages"]
     response = llm.invoke(messages)
     return {"messages": [response]}
 
-def should_search(state: AgentState) -> Literal["tools", "outliner"]:
+
+def should_search(state: AgentState) -> Literal["tools", "outliner", "end_error"]:
     """
-    FIX: Verificación segura de tool_calls. AIMessage siempre tiene el atributo,
-    pero otros tipos de mensaje (HumanMessage, ToolMessage) no lo tienen
-    o lo tienen vacío, por lo que usamos getattr con fallback.
+    FIX: Tres posibles rutas:
+      - 'tools'      → el LLM quiere hacer una búsqueda (hay tool_calls)
+      - 'end_error'  → hubo un error en la herramienta, cortamos el grafo
+      - 'outliner'   → búsqueda completada, pasamos a generar el esquema
     """
+    # Si search_node detectó un error de herramienta, salimos
+    if state.get("error"):
+        return "end_error"
+
     last_message = state["messages"][-1]
     tool_calls = getattr(last_message, "tool_calls", None)
     if tool_calls:
@@ -62,14 +92,14 @@ def should_search(state: AgentState) -> Literal["tools", "outliner"]:
     return "outliner"
 
 
+def error_node(state: AgentState):
+    """Nodo terminal que solo propaga el estado de error sin hacer nada más."""
+    return {}
+
+
 # --- SERIALIZACIÓN PARA DEBUG ---
 
 def serialize_event(event: dict) -> dict:
-    """
-    FIX: Los objetos BaseMessage no son JSON-serializables directamente.
-    Convertimos cada mensaje a un dict con type + content para poder
-    mostrarlos con st.json() sin errores.
-    """
     serialized = {}
     for node_name, state_update in event.items():
         serialized[node_name] = {}
@@ -78,7 +108,7 @@ def serialize_event(event: dict) -> dict:
                 serialized[node_name][key] = [
                     {
                         "type": msg.__class__.__name__,
-                        "content": str(msg.content)[:500],  # truncamos para legibilidad
+                        "content": str(msg.content)[:500],
                         "tool_calls": getattr(msg, "tool_calls", []),
                     }
                     for msg in value
@@ -91,13 +121,6 @@ def serialize_event(event: dict) -> dict:
 # --- FACTORY DEL GRAFO ---
 
 def build_graph(google_api_key: str, tavily_api_key: str, model_name: str):
-    """
-    FIX: Eliminamos @st.cache_resource con API keys como argumentos.
-    El caché de Streamlit no invalida correctamente cuando cambian strings
-    sensibles entre reruns. El grafo se reconstruye solo al pulsar el botón,
-    lo cual es aceptable dado que la operación es puntual.
-    También eliminamos 'convert_system_message_to_human' (deprecado).
-    """
     search_tool = TavilySearchResults(max_results=5, tavily_api_key=tavily_api_key)
     tools = [search_tool]
 
@@ -118,18 +141,20 @@ def build_graph(google_api_key: str, tavily_api_key: str, model_name: str):
     workflow.add_node("outliner", outliner_bound)
     workflow.add_node("writer", writer_bound)
     workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("end_error", error_node)  # FIX: nodo terminal de error
 
     workflow.set_entry_point("search")
 
     workflow.add_conditional_edges(
         "search",
         should_search,
-        {"tools": "tools", "outliner": "outliner"}
+        {"tools": "tools", "outliner": "outliner", "end_error": "end_error"}
     )
 
     workflow.add_edge("tools", "search")
     workflow.add_edge("outliner", "writer")
     workflow.add_edge("writer", END)
+    workflow.add_edge("end_error", END)  # FIX: el nodo de error también termina el grafo
 
     return workflow.compile()
 
@@ -146,7 +171,6 @@ def main():
         st.header("⚙️ Configuración")
         g_key = st.text_input("Google API Key", type="password")
         t_key = st.text_input("Tavily API Key", type="password")
-        # FIX: Selectbox alineado con los modelos reales disponibles
         model_selection = st.selectbox("Modelo", AVAILABLE_MODELS, index=0)
 
         if not (g_key and t_key):
@@ -169,12 +193,12 @@ def main():
         status_box = st.status("🚀 Ejecutando workflow...", expanded=True)
         final_content = ""
         debug_events = []
+        workflow_error = ""
 
         try:
-            inputs = {"messages": [HumanMessage(content=topic)]}
+            inputs = {"messages": [HumanMessage(content=topic)], "error": ""}
 
             for event in app_graph.stream(inputs):
-                # FIX: Serializamos el evento antes de guardarlo para debug
                 debug_events.append(serialize_event(event))
 
                 for node_name, state_update in event.items():
@@ -186,19 +210,31 @@ def main():
                         status_box.write("📝 **Outliner:** Creando esquema...")
                     elif node_name == "writer":
                         status_box.write("✍️ **Writer:** Redactando artículo...")
-
-                        if "messages" in state_update:
+                        if "messages" in state_update and state_update["messages"]:
                             last_msg = state_update["messages"][-1]
                             if isinstance(last_msg, AIMessage):
                                 final_content = last_msg.content
+                    elif node_name == "end_error":
+                        # FIX: capturamos el error del estado para mostrarlo al usuario
+                        workflow_error = state_update.get("error", "Error desconocido en la herramienta de búsqueda.")
 
-            status_box.update(label="✅ Proceso completado", state="complete", expanded=False)
-
-            if final_content:
+            # FIX: mostramos el error de forma clara en lugar de un warning genérico
+            if workflow_error:
+                status_box.update(label="❌ Error en la búsqueda", state="error", expanded=False)
+                if "401" in workflow_error or "Unauthorized" in workflow_error:
+                    st.error(
+                        "🔑 **Tavily API Key inválida o sin permisos (401 Unauthorized).**\n\n"
+                        "Verifica que tu clave de Tavily sea correcta en [tavily.com](https://tavily.com)."
+                    )
+                else:
+                    st.error(f"Error durante la búsqueda web:\n\n`{workflow_error}`")
+            elif final_content:
+                status_box.update(label="✅ Proceso completado", state="complete", expanded=False)
                 st.divider()
                 st.subheader("📰 Artículo Generado")
                 st.markdown(final_content)
             else:
+                status_box.update(label="⚠️ Sin contenido", state="complete", expanded=False)
                 st.warning("El flujo terminó pero no se detectó contenido final en el nodo Writer.")
 
             with st.expander("🔍 Ver traza interna (Debug)"):
